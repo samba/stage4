@@ -1,0 +1,892 @@
+#!/bin/bash
+
+# Stage 4 Command Interface.
+
+#=====================================================
+# Copyright: 	(c) Sam Briesemeister 2007
+# Contact: 	sam.briesemeister@gmail.com
+# License: 	GNU General Public License v2
+# Description:	
+#	Designed for Gentoo Linux as a snapshot backup
+#	solution. Requires loopback ISO9660 mounting,
+#	squashfs, md5sum,and mkisofs support.
+#	Also requires a livecd image that supports
+#	ISOLINUX boot.
+	
+#=====================================================
+
+
+base=`basename ${0}`
+path=`dirname ${0}`
+
+TIMESTAMP=`date +%s`
+
+# The classic 'usage' display.
+usage(){
+	echo -en "\E[1mUsage:\E[0m\n"
+
+	MODELIST="archive livecd mount restore verify support"
+
+	case "${1}" in
+		"archive") echo "${base} ${1} <profile> [silent]";;
+		"livecd") echo "${base} ${1} <profile> [silent]";;
+		"mount") echo "${base} ${1} <archive> <mountpoint> [silent]";;
+		"restore") echo "${base} ${1} <source mount> <destination mount>";;
+		"verify") echo "${base} ${1} <archive>";;
+		"support") echo "${base} ${1}";;
+		*) echo -e "${base} is a full-system exclusion-based snapshot backup tool.";
+			echo -e "${base} supports the following modes:"
+			for I in $MODELIST; do echo -e "\t\E[1m*\E[0m ${I}"; done
+			echo -e "\nAll modes support the 'silent' option to remove formatting and automate prompts."
+			;;
+	esac
+
+	echo
+	echo "Each mode is accessed using the syntax: ${base} <mode> <param1> <param2>"
+	echo "Usage for each mode can be found using '${base} usage <mode>'"
+	echo "For more information, please see /etc/stage4/README.txt"
+
+	exit 1
+}
+
+# Our command handler
+parseCommand(){
+	MODE=""
+	SILENT=0
+	ZENITY=0
+	declare ARGS
+	NumARGS=0
+
+	# require user to be 'root'
+	if [[ ! `whoami` = "root" ]]; then
+		echo "${base} requires 'root' access to all files."
+		exit 1
+	fi
+	
+
+	for I in $@; do
+		case "${I}" in
+			"silent") SILENT=1; ;;
+			"zenity") ZENITY=1; ;; # Contemplating adding support for a Zenity interface...
+			"usage" | "help" | "support" | "mount" | "restore" | "archive" | "livecd" | "verify") 
+				if [[ -z $MODE ]]; then MODE=${I}; 
+				else ARGS[${NumARGS}]=${I}; NumARGS=$((NumARGS+1)); fi ;;
+			*)  ARGS[${NumARGS}]=${I}; NumARGS=$((NumARGS+1));;
+		esac
+	done
+
+	export SILENT
+
+	case "${MODE}" in
+		"usage" | "help") usage ${ARGS[0]};;
+		"archive")	checkSupportCreate; checkSupportVerify; loadProfile ${ARGS[0]}; makeWorkDir; modeArchive 0;; 
+		"livecd")	checkSupportMount; checkSupportCreate; checkSupportVerify; 
+				loadProfile ${ARGS[0]}; makeWorkDir; modeLiveCD;;
+		"mount")	checkSupportVerify; checkSupportMount; 
+				modeVerify ${ARGS[0]} 0; modeMountArchive ${ARGS[0]} ${ARGS[1]};;
+		"restore")	loadProfile ${ARGS[2]}; modeRestore ${ARGS[0]} ${ARGS[1]};;
+		"verify")	checkSupportVerify; modeVerify ${ARGS[0]} 1;;
+		"support")	checkSupportCreate; checkSupportMount; checkSupportVerify;;
+		*)	echoc "fg:red" "st:bright" "Unknown Mode." "st:reset" "\n"; usage;;
+	esac
+}
+
+
+#=================================================================
+# PROFILE HANDLING FUNCTIONS
+
+loadProfile(){
+	# this function checks for the existence of profile configuration data, and
+	# passes it to the config parser.
+
+	showStatus "Loading Configuration"
+	
+	if [[ -z ${1} ]]; then
+		P=".stage4profile"
+	else
+		P=${1}
+	fi
+
+	AllProfiles="/etc/stage4/"
+	Global="${AllProfiles}/global.conf"
+	export ProfileDir="${AllProfiles}/${P}"
+	Config="${ProfileDir}/profile.conf"
+
+	if [[ ! -r ${Global} ]]; then
+		showReturn 1 "Global Configuration file not found. Expected: ${Global}"
+		exit $?
+	fi
+
+
+	if [[ ! -r ${Config} ]]; then
+		showReturn 1 "Profile Configuration file not found. Expected: ${Config}"
+		exit $?
+	fi
+
+	loadConfig ${Global}
+	loadConfig ${Config}
+
+
+	showReturn 0
+
+# These assist with debugging a little. 
+#	printConfig
+#	exit 1
+
+}
+	
+loadConfig(){
+	# this function reads the configuration file for the stage4 profile.
+	# format: 
+	# 	<option> <value>
+	# the format will also allow for comment lines initated with a hash (#) symbol
+
+	if [[ ! -r ${1} ]]; then
+		echo "Configuration parser could not find: ${1}"
+		exit 1
+	fi
+
+	ExclusionList="${Stage4GlobalRoot}"
+	SymlinkList=""
+
+	while read OPTION VALUE; do
+		if [[ ! -z ${OPTION} ]]; then
+			case "${OPTION}" in
+				\#* ) 	;; # do nothing with comments
+				"symlink") 
+					for I in ${VALUE}; do
+						SymlinkList="${SymlinkList} ${I}"
+					done
+					;;
+				"exclude")
+					for I in ${VALUE}; do
+						ExclusionList="${ExclusionList} ${I}"
+					done
+					;;
+				*) 	setvar="${OPTION}=\"${VALUE}\";"; eval "${setvar}"; ;;
+			esac
+		fi
+	done < ${1}
+
+	return $?
+}
+
+printConfig(){
+	echo "Configuration data:"
+	for I in ProfileName SourceCDImage DateString  DestinationFileName DEBUG RootFolder ErrorBuffer ConsoleBuffer ExclusionFile SymlinkFile RunBefore RunAfter ArchiveFile MountBase WorkBase LiveCDArchive LiveCDAutoRunScript LiveCDStage4Mount ExclusionList SymlinkList; do
+		echo -en "\t${I} is "
+		eval "N=\$${I}"
+		echo ${N}
+	done
+}
+
+makeWorkDir(){
+		showStatus "Creating Profile Working Directories"
+		# make Stage 4 root folder
+		mkdir -p ${RootFolder} 
+		# make mount points
+		mkdir -p ${MountBase}/iso ${MountBase}/livecd 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+		# make working directories
+		mkdir -p ${WorkBase}/iso ${WorkBase}/livecd 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+
+		echo ${TIMESTAMP} > ${RootFolder}/.timestamp
+		# initialize output buffers
+		cat /dev/null > ${ConsoleBuffer}
+		cat /dev/null > ${ErrorBuffer}
+		showReturn 0
+
+}
+
+
+#=================================================================
+# MAJOR MODE FUNCTIONS...
+#	Archive Assembler
+#	Live CD Assembler
+#	Stage4 Image Mounter
+#	Stage4 Extract/Restore
+
+
+# ========================================
+# Archive Assembler
+# 	Backup Stage4 Profile
+# 	Backup System Data
+#	> Pre-archival Script
+#	Assemble Archive - exclusions
+#	> Post-archival Script
+#	Clean up
+# ========================================
+modeArchive(){
+	announce "Archive Mode"
+	tellStatus "\n\n\nARCHIVE MODE\n\n"
+	
+	# Copy the profile into the archive's sample space 
+	tellStatus "copying profile to '${ArchiveProfile}'"
+	showStatus "Copying Stage 4 Profile into Archive"
+	mkdir -p ${ArchiveProfile} 1>>${ConsoleBuffer} 2>>${ErrorBuffer}
+	cp -av ${ProfileDir}/* ${ArchiveProfile}/ 1>>${ConsoleBuffer} 2>>${ErrorBuffer}
+	mkdir ${ArchiveProfile}/backup
+	showReturn $?
+
+	tellStatus "Backing up System Data"
+	showStatus "Backing up System Data"
+	# kernel name, version information, etc
+	uname -nmsrpio > ${ArchiveProfile}/backup/uname.txt  2>>${ErrorBuffer}
+	# another way to store kernel name, version, etc
+	cat /proc/version > ${ArchiveProfile}/backup/version.txt  2>>${ErrorBuffer}
+	# processor specs, to verify compatibility during restoration
+	cat /proc/cpuinfo > ${ArchiveProfile}/backup/cpuinfo.txt  2>>${ErrorBuffer}
+	# backup partition structures 
+	sfdisk -d > ${ArchiveProfile}/backup/partitions.txt  2>>${ErrorBuffer}
+
+
+	# EVMS Partitions, Volumes, etc...
+	EVMS=`which evms_metadata_backup`
+	EVMSConf="/etc/evms.conf"
+	if [[ -x ${EVMS} && -r ${EVMSConf} ]]; then
+		EVMSBackupDir=`grep metadata_backup_dir ${EVMSConf} | cut -d' ' -f 2`
+		SymlinkList="${SymlinkList} ${EVMSConf} ${EVMSBackupDir}/"
+		${EVMS} -v 1>>${ConsoleBuffer} 2>>${ErrorBuffer}
+		mkdir -p ${ArchiveProfile}/backup/EVMS
+		cp -r ${EVMSBackupDir} ${ArchiveProfile}/backup/EVMS/metadata
+	else
+		# Save the RAID configuration reports...
+		if [[ `which mdadm` ]]; then
+			mkdir -p ${ArchiveProfile}/backup/RAID
+			mdadm --detail --scan >> ${ArchiveProfile}/backup/RAID/mdadm-scan.txt
+			MDArrays=`mdadm --detail--scan | grep ARRAY | tr -s " " : | cut -d: -f2 2`
+			for Array in "${MDArrays}"; do
+				mdadm --detail ${Array} >> ${ArchiveProfile}/backup/RAID/mdadm-scan-`basename ${Array}`.txt
+			done
+		fi
+	
+		# Save LVM configuration reports...
+		if [[ `which lvm` ]]; then
+			mkdir -p ${ArchiveProfile}/backup/LVM
+			lvm pvs >> ${ArchiveProfile}/backup/LVM/PhysicalVolumes.txt
+			lvm vgs >> ${ArchiveProfile}/backup/LVM/VolumeGroups.txt
+			lvm lvs >> ${ArchiveProfile}/backup/LVM/LogicalVolumes.txt
+		fi
+
+	fi
+
+	
+
+	MNTBOOT=0
+	if [[ `grep /boot /etc/fstab` ]]; then # if /boot is a separate partition
+		if [[ ! `grep /boot /proc/mounts` ]]; then # and is not mounted
+			MNTBOOT=1	# remember that we mounted it here
+			mount /boot	# then mount it
+		fi
+	fi
+
+	# make a backup of /boot, just in case.
+	tar -czvf ${ArchiveProfile}/backup/boot-${DateString}.tgz /boot 1>> ${ConsoleBuffer} 2>> ${ErrorBuffer}
+
+	if [[ ${MNTBOOT} -eq 1 ]]; then 
+		umount /boot # dismount /boot if we mounted it earlier
+	fi
+
+	showReturn 0
+
+
+	# execute the RunBefore script
+	tellStatus "pre-archival script..."
+	showStatus "Running the pre-archival script..."
+	. ${RunBeforeArchive} 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	showReturn $?
+	
+	# assemble exclusion list into a long string...
+	# ExclusionList="${STAGE4_GLOBAL_ROOT} `cat ${ExclusionFile}`"
+	# NOTE: this is done using the config loader now...
+
+	# confirm overwriting existing archive, if it exists
+	confirmOverwrite ${ArchiveFile}
+	if [[ $? -eq 0 ]]
+	then
+		# continue
+		if [[ -f ${ArchiveFile} ]]; then rm ${ArchiveFile}; fi
+		showStatus "Creating Stage4 Archive..."
+		mksquashfs / ${ArchiveFile} -e ${ExclusionList} -check_data 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+		showReturn $?
+		# generate the checksum
+		OLDPWD=`pwd`; cd `dirname ${ArchiveFile}`
+		md5sum -b `basename ${ArchiveFile}` > `basename ${ArchiveFile}`.md5
+		cd $OLDPWD
+	else
+		# cancel
+		announce "Overwrite denied. Terminating."
+	fi
+	
+	# execute the RunAfter script
+	showStatus "Running the post-archival script..."
+	. ${RunAfterArchive} 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	showReturn $?
+	
+	showStatus "Cleaning up"
+	rm -rf ${ArchiveProfile}
+	showReturn $?
+
+
+
+
+	if [[ -r ${ArchiveFile} ]]; then
+		announce "Archive created" ${ArchiveFile}
+	fi
+	
+	if [[ -z ${1} || ${1} -eq 0 ]]
+	then
+		confirm "Shall I also create a Live CD Image?"
+		if [[ $? -eq 0 ]]; then modeLiveCD; fi
+		echo "Done."
+	fi
+
+	
+}
+
+
+
+# =============================================
+# Live CD assembler
+#	Extract source data 
+#	Merge Stage4 tools and symlinks
+#	Assemble new Live CD
+# =============================================
+modeLiveCD(){
+	announce "LiveCD Mode"
+		
+	if [[ ! -f ${ArchiveFile} ]]
+	then	# complain if the archive isn't found
+		echo -e "\tStage 4 archive not found. Automatically creating archive..."
+		tellStatus "Automatically switching to Archive mode, since archive ${ArchiveFile} wasn't found..."
+		modeArchive 1
+	fi
+	
+	tellStatus "\n\n\nLIVE CD MODE\n\n"
+
+	# ISOLINUX boot data
+	BootImage="isolinux/isolinux.bin"
+	BootCatalog="isolinux/boot.cat"
+
+
+	# extract the cd image
+	showStatus "Extracting CD Image..."
+	tellStatus "livecd: Extracting CD Image"
+	if [[ ! -f ${SourceCDImage} ]]
+	then
+		showReturn 1 "Could not find Source CD Image: ${SourceCDImage}\nTerminating."
+		tellStatus "TERM: could not find Source CD Image!  ${SourceCDImage}"
+		exit 1
+	else
+		tellStatus "Mounting Source CD Image"
+		mount -t iso9660 -o loop ${SourceCDImage} ${MountBase}/iso 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+		# check for ISO Linux support
+		tellStatus "Checking for ISOLINUX Boot Image"
+		if [[ ! -f ${MountBase}/iso/${BootImage} ]]
+		then # quit when ISOLINUX support is absent
+			showReturn 1 "Could not locate ISOLINUX Boot Image: ${BootImage}"
+			umount ${MountBase}/iso 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+			exit 1
+		fi
+		tellStatus "Checking for ISOLINUX Boot Catalog"
+		if [[ ! -f ${MountBase}/iso/${BootCatalog} ]]
+		then # quit when ISOLINUX support is absent
+			showReturn 1 "Could not locate ISOLINUX Boot Catalog: ${BootCatalog}"
+			umount ${MountBase}/iso 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+			exit 1
+		fi
+		tellStatus "Copying LiveCD ISO Image contents to Working Directory."
+		cp -a ${VERBOSE} ${MountBase}/iso/* ${WorkBase}/iso 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+		umount ${MountBase}/iso 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	fi
+	showReturn 0
+	
+#BEGIN Live CD Assembly
+	showStatus "Extracting LiveCD Environment..."
+	# extract the livecd archive
+	tmpLiveCDArchive=${WorkBase}/iso/${LiveCDArchive}
+	if [[ ! -f ${tmpLiveCDArchive} ]]
+	then
+		showReturn 1 "Could not find Live CD Archive: ${tmpLiveCDArchive}"
+		# clean up from previous extraction
+		rm -rf ${WorkBase}/iso/* 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+		exit 1
+	else
+		mount -t squashfs -o loop ${tmpLiveCDArchive} ${MountBase}/livecd 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+		N=`cp -a ${VERBOSE} ${MountBase}/livecd/* ${WorkBase}/livecd 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}`
+		umount ${MountBase}/livecd 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	fi
+	showReturn $N
+	
+
+	# Copy Stage4 tools into LiveCD
+	showStatus "Copying Stage4 tools into LiveCD"
+	mkdir -p ${WorkBase}/livecd/${path} 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	cp -a ${path}/* ${WorkBase}/livecd/${path}/ 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	showReturn $?
+		
+	# Symlink to Stag4 profile
+	mkdir ${WorkBase}/livecd/etc/stage4 1>> ${ConsoleBuffer} 2>> ${ErrorBuffer}
+	ln -sf ${LiveCDStage4Mount}${ArchivProfile} ${WorkBase}/livecd/etc/stage4/.stage4profile \
+		1>> ${ConsoleBuffer} 2>> ${ErrorBuffer}
+
+	# Create (dangling) symbolic links listed in SymlinkFile 
+	confirm "Link Stage 4 references into Live CD system tree?"
+	if [[ $? -eq 0 ]]
+	then
+		showStatus "Creating symbolic links..."
+	#	while read ITEM;
+		for ITEM in ${SymlinkList}
+		do
+			ln -sf ${LiveCDStage4Mount}/${ITEM} ${WorkBase}/livecd/${ITEM} 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	#	done < ${SymlinkFile}
+		done
+
+		showReturn 0
+	fi
+
+
+	showStatus "Activating Automatic Mount-on-boot in LiveCD..."
+	# Remove OLD auto-run calls from auto-run script on CD
+	sed -e /${base}/d ${WorkBase}/livecd/${LiveCDAutoRunScript} \
+		> ${WorkBase}/livecd/${LiveCDAutoRunScript}
+	
+	# Update auto-run script with proper file names for auto-mount
+	echo "${path}/${base} mount /mnt/cdrom/${DestinationFileName} ${LiveCDStage4Mount}" \
+		>> ${WorkBase}/livecd/${LiveCDAutoRunScript}
+	showReturn 0
+		
+	# Assemble LiveCD archive
+	showStatus "Assembling LiveCD Environment..."
+	if [[ -f ${WorkBase}/${LiveCDArchive} ]]; then rm -rf ${WorkBase}/${LiveCDArchive}; fi
+	N=`mksquashfs ${WorkBase}/livecd ${WorkBase}/${LiveCDArchive} -check_data 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}`
+	rm -rf ${WorkBase}/livecd/* 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	showReturn $N
+	
+	
+	# Insert NEW LiveCD archive into CD Image
+	mv ${WorkBase}/${LiveCDArchive} ${WorkBase}/iso/${LiveCDArchive} 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	
+	# generate checksum for LiveCD Archive
+	OLDPWD=`pwd`; cd ${WorkBase}/iso
+	md5sum -b ${LiveCDArchive} > ${LiveCDArchive}.md5
+	cd ${OLDPWD}
+#END Live CD Operations
+
+	
+	# Insert Stage 4 archive into CD Image
+	showStatus "Copying Stage4 archive into LiveCD..."
+	cp ${ArchiveFile}* ${WorkBase}/iso 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	showReturn $?
+	
+	# build NEW CD Image
+	showStatus "Building LiveCD Image..."
+	CDOutputName="${RootFolder}/${ProfileName}-${DateString}.iso"
+	mkISOcommand="mkisofs -no-emul-boot -boot-load-size 4 -boot-info-table "
+	mkISOcommand="${mkISOcommand} -r -b ${BootImage} -c ${BootCatalog} "
+	mkISOcommand="${mkISOcommand} -o ${CDOutputName} ${WorkBase}/iso "
+	N=`eval ${mkISOcommand} 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}`
+	rm -rf ${WorkBase}/iso/* 1>> ${ConsoleBuffer}  2>> ${ErrorBuffer}
+	showReturn $?
+	
+	# generate checksum for CD Image
+	OLDPWD=`pwd`; cd ${RootFolder}
+	md5sum -b ${ProfileName}-${DateString}.iso > ${ProfileName}-${DateString}.iso.md5 
+	cd ${OLDPWD}
+	
+	announce "CD Image created" ${CDOutputName}
+	exit 0
+}
+
+modeVerify(){
+	announce "Verify mode" "This can take a LONG time!"
+
+	showStatus "Locating Archive"
+	if [[ ! -r ${1} ]]; then
+		showReturn 1  "Could not find the archive."
+		exit 1
+	else 
+		showReturn 0
+	fi
+
+	announce "Because this can be very time consuming, we give you the opportunity to skip it..."
+	confirm "Do you want to SKIP archive verification?"
+	if [[ $? -eq 0 ]]; then
+		announce "Skipping verification." "Using corrupted archives can have BAD side effects! Proceed with caution!"
+	else
+		# proceed with verification
+		showStatus "Verifying Archive..."
+		OLDPWD=`pwd`; cd `dirname ${1}`
+		ARCHIVE=`basename ${1}`
+		md5sum --status -c ${ARCHIVE}.md5
+		showReturn $? "WARNING: This archive did NOT pass checksum verification!"
+		if [[ $? -ne 0 && ${2} -eq 0 ]]; then 
+			announce "Archive failed checksum verification. Use with caution!"
+			confirm "Are you sure you want to use this archive, even with a bad checksum?";
+			if [[ $? -ne 0 ]]; then exit $?; fi
+		fi
+		cd ${OLDPWD}
+	fi
+}
+
+
+
+
+# ====================================
+# Stage4 Archive Mounter
+# ...
+# ====================================
+modeMountArchive(){
+	# mount stage4 archive
+	announce "Mount mode"
+	
+	showStatus "Locating Mount Point"
+	if [[ -z ${2} ]]
+	then
+		showReturn 1 "Mount point not specified. Terminating."
+		exit 1
+	else
+		showReturn 0
+	fi
+	
+        checkMount ${2}
+	if [[ $? -ne 0 ]]; then exit 1; fi
+
+	# make the mountpoint if it doesn't exist.
+	if [[ ! -d ${2} ]]; then mkdir -p ${2}; fi
+	
+
+	mount -o loop -t squashfs ${1} ${2}
+	
+	announce "Mount complete." "${1} mounted at ${2}"
+	exit 0
+}
+
+
+# ================================
+# Stage4 Restore
+#	Extract archive, restore system
+# ================================
+modeRestore(){	
+	announce "Restore mode" "Low-level automation (e.g. partitioning, RAID, LVM) is currently not supported. Please handle these MANUALLY"
+	# copy stage4 contents to a mounted system
+	
+	OUTPUT="${HOME}/stage4_restore_`date +%s`.txt"
+	
+	checkMount ${1}
+	M1=$?
+	checkMount ${2}
+	M2=$?
+	
+	if [[ $M1 -eq 0 || $M2 -eq 0 ]]
+	then
+		announce "Stage4 Requires 2 MOUNTED directories to conduct a system restore."
+		exit 1
+	fi
+	
+
+	if [[ ! -d ${ArchiveProfile} ]]; then
+		announce "Could not locate Stage 4 profile information" "Location: ${1}"
+		exit 1
+	fi
+	
+	U1=`cat /proc/cpuinfo`
+	U2=`cat ${ArchiveProfile}/backup/cpuinfo.txt`
+	if [[ ! ${U1} = ${U2} ]]; then
+		announce "This Stage4 archive was built on a different processor." "This hardware may not be compatible with this Stage4 system archive."
+		confirm "Are you SURE you want to restore this Stage4 onto this system?"
+		if [[ $? -ne 0 ]]; then 
+			announce "Stage4 Restore Canceled."
+			exit 1
+		fi
+	fi
+	
+	# Restore partition tables
+	P1=`sfdisk -d 2>>/dev/null`
+	P2="${ArchiveProfile}/backup/partitions.txt"
+	if [[ ! ${P1} = `cat ${P2}` ]]; then
+		confirm "Would you like to restore the partition table(s)? This may destroy your data."
+		# if yes, then 'sfdisk < ${P2}'
+		announce "Restoring partition tables is not currently supported."
+	fi
+
+	# Restore EVMS structures
+	EVMS=`which evms_metadata_restore`
+	EVMSConfig="/etc/evms.conf"
+	if [[ -x ${EVMS} && -r ${EVMSConfig} ]]; then
+		confirm "Would you like me to re-enstate your EVMS Configuration? This may destroy your data."
+		if [[ $? -eq 0 ]]; then
+			# ${EVMS} -a
+			announce "Automatic EVMS recovery is not currently supported."
+		fi
+	fi
+
+	# RAID (mdadm)
+	# Data stored at ${ArchiveProfile}/backup/RAID/mdadm-scan*.txt
+
+		# MDRAID Partitions...
+		#	read mdadm status information to re-create RAID pairs/sets
+		#	http://www.die.net/doc/linux/man/man8/mdadm.8.html
+
+		# List of arrays
+		# mdadm --detail --scan | grep ARRAY | tr -s " " : | cut -d: -f 2,3
+		#	returns <RAID device, eg /dev/md0> <RAID level>
+
+		# Devices for a specific array:
+		# mdadm --detail ${MD_ARRAY} | column -t | tr -s " " : | cut -d: -f 7
+
+		# RAID Autodetect Partition type: FD
+
+		# Recreating the arrays...
+		#	mdadm --create --auto=<device part, eg md0> --<RAID level> ... [UNFINISHED]
+
+
+	# LVM
+	# Data stored at ${ArchiveProfile}/backup/LVM/*.txt
+
+		# LVM Partitions...
+		# 	read LVM status info to re-create LVM PVs, VGs, and LVs
+		#	pvscan, vgscan, lvscan
+		#	'man lvm' mentions an option "dumpconfig"
+
+		# List of physical volumnes
+		# pvscan | grep PV | column -t | tr -s " " : | cut -d: -f 2
+		# pvs | sed -e1d | column -t | tr -s " " : | cut -d: -f 1,2
+		#	returns <device> <group>
+
+		# List of volume groups
+		# vgs | sed -e1d | column -t | tr -s " " : | cut -d: -f 1
+		
+		# List of logical volumes
+		# lvs | sed -e1d | column -t | tr -s " " : | cut -d: -f1,2
+		#	returns <volume> <group>
+
+		# LVM Autodetect Partition Type: 8E
+
+
+
+	# Double check: copying Stage 4 content to system partitions...
+	confirm "Restoring a system will over-write all settings. Are you sure?"
+	if [[ $? -ne 0 ]]; then exit $?; fi
+	
+	showStatus "Copying filesystem from Stage4 to ${2}..."
+	cp -av ${1}/* ${2}/ 2>${OUTPUT} 1>${OUTPUT}
+	showReturn $?
+	announce "Restore complete." "Log file: ${OUTPUT}"
+	
+	exit 0
+}
+
+
+
+#=================================================================
+# SYSTEM SUPPORT FUNCTIONS
+# Using 'find' in these is SLOW! I switched to 'which', it's fast.
+
+supportProgramCheck(){
+	return `which ${1} 2>/dev/null | grep ${1} 1>/dev/null`
+}
+supportMountCheck(){
+	return `grep ${1} /proc/filesystems 2>/dev/null 1>/dev/null`
+}
+
+
+checkSupportCreate(){
+	showStatus "Checking system support creating SquashFS archives"
+	supportProgramCheck mksquashfs
+	showReturn $? "Stage4 requires the program 'mksquashfs' to function properly."
+	if [[ $? -ne 0 ]]; then exit $?; fi
+	showStatus "Checking system support creating ISO9660 CD images"
+	supportProgramCheck mkisofs
+	showReturn $? "Stage4 requires the program 'mkisofs' to function properly."
+	if [[ $? -ne 0 ]]; then exit $?; fi
+	return 0
+}
+
+checkSupportMount(){
+	showStatus "Checking system support mounting SquashFS archives"
+	supportMountCheck squashfs
+	showReturn $? "Stage4 requires kernel mount support for 'squashfs' filesystems."
+	if [[ $? -ne 0 ]]; then exit $?; fi
+	showStatus "Checking system support mounting ISO9660 CD images"
+	supportMountCheck iso9660
+	showReturn $? "Stage4 requires kernel mount support for 'iso966' filesystems."
+	if [[ $? -ne 0 ]]; then exit $?; fi
+	return 0
+}
+
+checkSupportVerify(){
+	showStatus "Checking system support for md5 checksum verification"
+	supportProgramCheck md5sum
+	showReturn $? "Stage4 requires the program 'md5sum' to function properly."
+	return $?
+}
+
+#=================================================================
+# COMMON OUTPUT & ERROR HANDLING FUNCTIONS
+
+checkMount(){
+	#P=`dirname ${1}`
+	P=${1}
+	showStatus "Checking Mountpoint..."
+	if [[ `grep ${P} /proc/mounts` ]]
+	then 
+		showReturn 1 "${P} in use."
+		return 1 
+	else 
+		showReturn 0
+		return 0
+	fi
+}
+
+
+announce(){
+	if [[ ${SILENT} -eq 0 ]]; then
+		# pre-pending 3 yellow stars...
+		#echoc "fg:yellow" "st:bright" "\040\052\052\052\040"
+		
+		# prepending single green star
+		echoc "fg:green" "st:bright" "\040\052\040" "st:reset"
+		echoc "fg:yellow" "st:bright" "${1}" "st:reset" "\n"
+		
+		# appending 3 yellow stars...
+		#echoc "fg:yellow" "st:bright" "\040\052\052\052\040" "st:reset" "\n"
+		if [[ ! -z ${2} ]]; then
+			echo -e "\t${2}\n"
+		fi
+	else
+		echo "Announce: ${1} <${2}>"
+	fi
+}
+
+showStatus(){
+	if [[ ${SILENT} -eq 0 ]]; then
+		echoc "fg:green" "st:bright" "\040\052\040" "st:reset"
+		echo -n ${1}
+			
+		COLUMNS=`tput cols`
+		D=$((${COLUMNS} - ${#1})) # length of a line less length of message...
+		D=$((D - 3)) # less the length of the tag header (3)
+		D=$((D - 6)) # less the length of the status result...
+		
+		for (( i=1; i < D ; i++ )); do
+			echo -en "\040"
+		done
+	else
+		echo -en "Status: ${1}..."
+	fi
+}
+showReturn(){
+	if [[ ${SILENT} -eq 0 ]]; then
+		echoc "st:bright" "fg:blue"  "[\040"
+		if [[ ${1} -eq 0 ]]
+		then
+			# ignore the 2nd argument...
+			echoc "fg:green" "st:bright" "OK"
+		else	
+			# offer the 2nd argument for debugging.
+			echoc "fg:red" "st:bright" "!!"
+		fi
+		echoc "fg:blue" "st:bright" "\040]" "st:reset" "\n"
+		if [[ ${1} -ne 0 && ! -z ${2} ]]
+		then echo -en "\t${2} [${1}]\n\n"; fi
+	else
+		if [[ ${1} -eq 0 ]]; then R="Successful."; else R="Failure."; fi
+		echo "Return: ${R}"
+	fi
+	
+	return ${1}
+	
+}
+
+
+tellStatus(){
+	echo -e ${1} >> ${ConsoleBuffer}
+	echo -e ${1} >> ${ErrorBuffer}
+}
+
+
+
+confirmOverwrite(){
+	if [[ -f ${1} ]]
+	then
+		confirm "Overwrite ${1}?"
+		return $?
+	fi
+	return 0
+}
+
+# SUPPORTING FUNCTIONS
+
+
+confirm(){
+	if [[ ${SILENT} -eq 0 ]]; then
+		# Returns 0 when user confirms, i.e. enters anything other than 'N' or 'n'
+		echoc "fg:green" "st:bright" "\040\052\040" "st:reset" "Confirm: ${1}" "fg:blue" "\t[Y/n]" "st:reset" "\t"
+		read confirmation
+		# For some reason BASH stopped playing nice with =~ regexp matching...
+		# Switched to 'grep' for long-term compatibility.
+		if [[ `echo $confirmation | grep [Nn]` ]]; then return 1; else return 0; fi
+	else
+		# In silent mode, we always return "true" to confirmations... 
+		return 0
+	fi
+}
+
+
+echostyle(){
+	# expects: (one of the following...)
+	#	<fgcolor> <text>
+	#	<fgcolor> <bgcolor> <text>
+	#	<fgcolor> <bgcolor> <style> <text>
+	case $# in
+		2) echoc "fg:${1}" ${2} "st:reset" "\n";;
+		3) echoc "fg:${1}" "bg:${2}" ${3} "st:reset" "\n";;
+		4) echoc "fg:${1}" "bg:${2}" "st:${3}" ${4} "st:reset" "\n" ;;
+		*) return 0;;
+	esac
+	
+}
+
+echoc(){
+	# allows a user to specify in english what colors they want, in the following
+	# format: echoc "st:bright" "fg:blue" "my output text" "st:reset" "\n"
+		
+	for N in "$@"
+	do
+		ATTR=${N%:*}
+		VAL=${N#*:}
+		case ${ATTR} in
+			"bg") echobg ${VAL};;
+			"fg") echofg ${VAL};;
+			"st") echost ${VAL};;
+			*) echo -en ${N} ;;
+		esac
+		ATTR=""
+		VAL=""
+	done
+	echost "reset";
+}
+
+echobg(){
+	black='0'; red='1'; green='2'; yellow='3'; blue='4'; magenta='5'; cyan='6'; white='7'
+	eval BG=\$$1
+	echo -en "\E[4${BG}m"
+}
+
+echofg(){
+	black='0'; red='1'; green='2'; yellow='3'; blue='4'; magenta='5'; cyan='6'; white='7'
+	eval FG=\$$1
+	echo -en "\E[3${FG}m"
+}
+echost(){
+	reset='0'; bright='1'; dim='2'; underscore='3'; blink='5'; reverse='7'; hidden='8'
+	eval ST=\$$1
+	echo -en "\E[${ST}m"
+}
+
+
+
+# call our real code ;)
+parseCommand $@
+
+
